@@ -11,6 +11,59 @@
 static CFStringRef const kCCAPrefsDomain = CFSTR("com.futur3sn0w.ccaster.preferences");
 static NSString *const kCCAReloadNotification = @"com.futur3sn0w.ccaster/ReloadPrefs";
 
+// ---------------------------------------------------------------------------
+// iOS 14 compatibility helpers. These APIs were added in iOS 15/16 and are
+// absent from the iOS 14 SDK, so they are resolved at runtime instead.
+// ---------------------------------------------------------------------------
+static UIImage *CCAApplySymbolConfiguration(UIImage *image, UIImageSymbolConfiguration *configuration) {
+    if (!image || !configuration) return image;
+    SEL applySelector = NSSelectorFromString(@"imageByApplyingSymbolConfiguration:");
+    if ([image respondsToSelector:applySelector]) {
+        return ((UIImage *(*)(id, SEL, id))objc_msgSend)(image, applySelector, configuration) ?: image;
+    }
+    // iOS 13/14 equivalent.
+    return [image imageWithConfiguration:configuration] ?: image;
+}
+
+// Hierarchical colour is iOS 15+. On iOS 14 fall back to a template image;
+// callers set tintColor on the image view, which gives the same result for
+// the single-layer glyphs used here.
+static UIImage *CCAHierarchicalSymbolImage(UIImage *image, UIColor *color) {
+    if (!image || !color) return image;
+    SEL configSelector = NSSelectorFromString(@"configurationWithHierarchicalColor:");
+    SEL applySelector = NSSelectorFromString(@"imageByApplyingSymbolConfiguration:");
+    if ([UIImageSymbolConfiguration respondsToSelector:configSelector] && [image respondsToSelector:applySelector]) {
+        id configuration = ((id (*)(id, SEL, id))objc_msgSend)([UIImageSymbolConfiguration class], configSelector, color);
+        UIImage *result = configuration ? ((UIImage *(*)(id, SEL, id))objc_msgSend)(image, applySelector, configuration) : nil;
+        if (result) return result;
+    }
+    return [image imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+}
+
+// UISheetPresentationController is iOS 15+. On iOS 14 the page sheet simply
+// presents as the standard card, which is fine.
+static void CCAConfigureSheetPresentation(UIViewController *sheet) {
+    SEL sheetSelector = NSSelectorFromString(@"sheetPresentationController");
+    if (![sheet respondsToSelector:sheetSelector]) return;
+    id presentation = ((id (*)(id, SEL))objc_msgSend)(sheet, sheetSelector);
+    if (!presentation) return;
+    Class detentClass = NSClassFromString(@"UISheetPresentationControllerDetent");
+    SEL largeSelector = NSSelectorFromString(@"largeDetent");
+    if (detentClass && [detentClass respondsToSelector:largeSelector] &&
+        [presentation respondsToSelector:NSSelectorFromString(@"setDetents:")]) {
+        id large = ((id (*)(id, SEL))objc_msgSend)(detentClass, largeSelector);
+        if (large) ((void (*)(id, SEL, id))objc_msgSend)(presentation, NSSelectorFromString(@"setDetents:"), @[large]);
+    }
+    SEL grabberSelector = NSSelectorFromString(@"setPrefersGrabberVisible:");
+    if ([presentation respondsToSelector:grabberSelector]) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(presentation, grabberSelector, YES);
+    }
+    SEL radiusSelector = NSSelectorFromString(@"setPreferredCornerRadius:");   // iOS 16+
+    if ([presentation respondsToSelector:radiusSelector]) {
+        ((void (*)(id, SEL, CGFloat))objc_msgSend)(presentation, radiusSelector, 30.0);
+    }
+}
+
 static BOOL gEnabled = YES;
 static BOOL gQuickAccessButtonsEnabled = YES;
 static BOOL gPagingEnabled = YES;
@@ -297,6 +350,13 @@ static __weak UIView *gCCAActiveResizeModuleView = nil;
 // the native dismissal seams. Whichever exits edit mode first opens this
 // window so the sibling request from the same gesture cannot also close CC.
 static CFTimeInterval gCCAEditExitConsumedUntil = 0;
+// iOS < 16: Control Center is dismissed outright (there is no cancellable
+// "first swipe only leaves edit mode" stage), and the progress callbacks that
+// drive the overlay chrome during dismissal are not delivered. These track an
+// in-flight dismissal so edit chrome, page dots and quick-access buttons leave
+// with Control Center instead of lingering until the late state-0 callback.
+static BOOL gCCALegacyPresentation = NO;
+static BOOL gCCAOverlayDisappearing = NO;
 static CFTimeInterval gCCAExpandedChromeRevealUntil = 0;
 static NSUInteger gCCACurrentPage = 0;
 static NSUInteger gCCAPageCount = 1;
@@ -1883,9 +1943,7 @@ static void CCAUpdateSliderGlyphColor(UIView *slider, float value, BOOL animate)
             if (imageView) {
                 UIImage *baseImage = objc_getAssociatedObject(host, kCCASliderGlyphOriginalImageKey) ?: imageView.image;
                 if (baseImage) {
-                    UIImageSymbolConfiguration *configuration = [UIImageSymbolConfiguration configurationWithHierarchicalColor:displayColor];
-                    UIImage *configured = [baseImage imageByApplyingSymbolConfiguration:configuration];
-                    imageView.image = configured ?: [baseImage imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+                    imageView.image = CCAHierarchicalSymbolImage(baseImage, displayColor);
                     imageView.tintColor = displayColor;
                 }
             }
@@ -1936,7 +1994,7 @@ static void CCAUpdateSliderGlyphColor(UIView *slider, float value, BOOL animate)
         symbolState = routeState ?: @"volume.externalRoute";
         UIImageSymbolConfiguration *routeConfiguration =
             [UIImageSymbolConfiguration configurationWithPointSize:26.0 weight:UIImageSymbolWeightRegular];
-        nativeGlyph = [routeGlyph imageByApplyingSymbolConfiguration:routeConfiguration] ?: routeGlyph;
+        nativeGlyph = CCAApplySymbolConfiguration(routeGlyph, routeConfiguration) ?: routeGlyph;
     } else if (isMutedVolume) {
         symbolState = @"volume.muted";
         nativeGlyph = [UIImage systemImageNamed:@"speaker.slash.fill" withConfiguration:symbolConfiguration];
@@ -1947,10 +2005,12 @@ static void CCAUpdateSliderGlyphColor(UIView *slider, float value, BOOL animate)
         nativeGlyph = [UIImage systemImageNamed:symbolName withConfiguration:symbolConfiguration];
     } else {
         symbolState = @"brightness.variable";
-        if (@available(iOS 16.0, *)) {
-            nativeGlyph = [UIImage systemImageNamed:@"sun.max.fill"
-                                       variableValue:variableValue
-                                    withConfiguration:symbolConfiguration];
+        // Variable-value symbols are iOS 16+; on iOS 14 the static
+        // sun.max.fill fallback below is used instead.
+        SEL variableSelector = NSSelectorFromString(@"systemImageNamed:variableValue:withConfiguration:");
+        if ([UIImage respondsToSelector:variableSelector]) {
+            nativeGlyph = ((UIImage *(*)(id, SEL, id, double, id))objc_msgSend)([UIImage class], variableSelector,
+                                                                                @"sun.max.fill", (double)variableValue, symbolConfiguration);
         }
     }
     if (!nativeGlyph) {
@@ -1973,9 +2033,7 @@ static void CCAUpdateSliderGlyphColor(UIView *slider, float value, BOOL animate)
         CGPoint center = ((CGPoint (*)(id, SEL))objc_msgSend)((id)slider, @selector(glyphCenter));
         colorGlyph.center = center;
         [slider bringSubviewToFront:colorGlyph];
-        UIImageSymbolConfiguration *colorConfiguration = [UIImageSymbolConfiguration configurationWithHierarchicalColor:displayColor];
-        UIImage *configured = [nativeGlyph imageByApplyingSymbolConfiguration:colorConfiguration];
-        UIImage *nextImage = configured ?: [nativeGlyph imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+        UIImage *nextImage = CCAHierarchicalSymbolImage(nativeGlyph, displayColor);
         NSString *previousSymbolState = objc_getAssociatedObject(slider, kCCASliderGlyphSymbolStateKey);
         BOOL symbolStateChanged = previousSymbolState.length && ![previousSymbolState isEqualToString:symbolState];
 
@@ -3570,6 +3628,40 @@ static NSUInteger CCADerivedVisiblePageForOverlay(UIViewController *overlay) {
 @end
 
 
+// Runs a block once per display frame until it returns YES.
+@interface CCAFrameLinkTarget : NSObject
+@property (nonatomic, copy) BOOL (^tick)(CFTimeInterval elapsed, CFTimeInterval delta);
+@property (nonatomic, strong) CADisplayLink *link;
+@property (nonatomic, assign) CFTimeInterval startTime;
+@property (nonatomic, assign) CFTimeInterval lastTime;
++ (instancetype)startWithTick:(BOOL (^)(CFTimeInterval elapsed, CFTimeInterval delta))tick;
+- (void)stop;
+@end
+
+@implementation CCAFrameLinkTarget
++ (instancetype)startWithTick:(BOOL (^)(CFTimeInterval, CFTimeInterval))tick {
+    CCAFrameLinkTarget *target = [self new];
+    target.tick = tick;
+    target.link = [CADisplayLink displayLinkWithTarget:target selector:@selector(fire:)];
+    [target.link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+    return target;
+}
+- (void)fire:(CADisplayLink *)link {
+    CFTimeInterval now = link.timestamp;
+    if (self.startTime == 0) { self.startTime = now; self.lastTime = now; }
+    CFTimeInterval elapsed = now - self.startTime;
+    CFTimeInterval delta = now - self.lastTime;
+    self.lastTime = now;
+    BOOL done = self.tick ? self.tick(elapsed, delta) : YES;
+    if (done) [self stop];
+}
+- (void)stop {
+    [self.link invalidate];
+    self.link = nil;
+    self.tick = nil;
+}
+@end
+
 @interface CCAsterCoordinator : NSObject <UIGestureRecognizerDelegate>
 + (instancetype)shared;
 - (void)installOnOverlay:(UIViewController *)controller;
@@ -3606,6 +3698,7 @@ static NSUInteger CCADerivedVisiblePageForOverlay(UIViewController *overlay) {
 - (void)setEditControlsSuppressedForPaging:(BOOL)suppressed overlay:(UIViewController *)overlay animated:(BOOL)animated;
 - (void)setEditing:(BOOL)editing;
 - (void)dismissEditingImmediately;
+- (void)overlayBeginningDismissal:(UIViewController *)overlay;
 - (void)setEditPresentation:(BOOL)editing forOverlay:(UIViewController *)overlay animated:(BOOL)animated;
 - (void)applyRestingModuleOffsetToOverlay:(UIViewController *)overlay;
 - (void)setQuickAccessButtonsHidden:(BOOL)hidden forOverlay:(UIViewController *)overlay animated:(BOOL)animated;
@@ -6245,16 +6338,16 @@ static NSUInteger CCADerivedVisiblePageForOverlay(UIViewController *overlay) {
     button.backgroundColor = UIColor.clearColor;
     button.tintColor = UIColor.whiteColor;
     UIImageSymbolConfiguration *symbolConfiguration = [UIImageSymbolConfiguration configurationWithPointSize:10.0 weight:UIImageSymbolWeightSemibold];
-    UIButtonConfiguration *configuration = [UIButtonConfiguration plainButtonConfiguration];
-    configuration.image = [UIImage systemImageNamed:@"plus.circle.fill" withConfiguration:symbolConfiguration];
-    configuration.attributedTitle = [[NSAttributedString alloc] initWithString:@"Add a Control" attributes:@{
+    [button setImage:[UIImage systemImageNamed:@"plus.circle.fill" withConfiguration:symbolConfiguration] forState:UIControlStateNormal];
+    [button setAttributedTitle:[[NSAttributedString alloc] initWithString:@"Add a Control" attributes:@{
         NSFontAttributeName: [UIFont systemFontOfSize:12.5 weight:UIFontWeightSemibold],
         NSForegroundColorAttributeName: UIColor.whiteColor,
-    }];
-    configuration.baseForegroundColor = UIColor.whiteColor;
-    configuration.imagePadding = 4.0;
-    configuration.contentInsets = NSDirectionalEdgeInsetsMake(6.0, 10.0, 6.0, 14.0);
-    button.configuration = configuration;
+    }] forState:UIControlStateNormal];
+    // Equivalent of imagePadding 4 / contentInsets (6, 10, 6, 14).
+    button.imageEdgeInsets = UIEdgeInsetsMake(0.0, -2.0, 0.0, 2.0);
+    button.titleEdgeInsets = UIEdgeInsetsMake(0.0, 2.0, 0.0, -2.0);
+    button.contentEdgeInsets = UIEdgeInsetsMake(6.0, 12.0, 6.0, 16.0);
+    [button sizeToFit];
     [button addTarget:self action:@selector(addControlTapped:) forControlEvents:UIControlEventTouchUpInside];
     button.alpha = 0.0;
     button.hidden = YES;
@@ -6345,10 +6438,7 @@ static NSUInteger CCADerivedVisiblePageForOverlay(UIViewController *overlay) {
         CCAAddControlSheetViewController *sheet = [CCAAddControlSheetViewController new];
         sheet.catalog = [self availableControlCatalog];
         sheet.modalPresentationStyle = UIModalPresentationPageSheet;
-        UISheetPresentationController *presentation = sheet.sheetPresentationController;
-        presentation.detents = @[UISheetPresentationControllerDetent.largeDetent];
-        presentation.prefersGrabberVisible = YES;
-        presentation.preferredCornerRadius = 30.0;
+        CCAConfigureSheetPresentation(sheet);
         gCCAAddSheetPresentationActive = YES;
         [overlay presentViewController:sheet animated:YES completion:^{
             gCCAAddSheetPresentationActive = NO;
@@ -6413,7 +6503,6 @@ static NSUInteger CCADerivedVisiblePageForOverlay(UIViewController *overlay) {
     NSArray<NSString *> *bundleDirectories = @[
         @"/System/Library/ControlCenter/Bundles",
         @"/Library/ControlCenter/Bundles",
-        @"/var/jb/Library/ControlCenter/Bundles",
     ];
     for (NSString *directory in bundleDirectories) {
         for (NSString *item in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:directory error:nil]) {
@@ -8616,34 +8705,96 @@ static NSUInteger CCADerivedVisiblePageForOverlay(UIViewController *overlay) {
         }
         UIView *dragProxy = objc_getAssociatedObject(gesture, kCCADragProxyKey);
         if (didSwap && dragProxy) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.08 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                UIViewController *settledSource = nil;
-                for (UIViewController *candidate in CCACollectModuleControllers(overlay)) {
-                    if ([CCAModuleIdentifier(candidate) isEqualToString:sourceID]) { settledSource = candidate; break; }
-                }
-                CGRect destination = settledSource ? CCAVisibleModuleFrame(settledSource, overlay) : dragProxy.frame;
-                settledSource.view.alpha = 0.0;
-                UIVisualEffectView *settledBorder = objc_getAssociatedObject(settledSource.view, @selector(applyEditingToModule:editing:));
-                settledBorder.alpha = 0.0;
-                settledBorder.hidden = YES;
-                CGRect visibleProxyFrame = dragProxy.layer.presentationLayer ? ((CALayer *)dragProxy.layer.presentationLayer).frame : dragProxy.frame;
-                [UIView performWithoutAnimation:^{ dragProxy.transform = CGAffineTransformIdentity; dragProxy.frame = visibleProxyFrame; }];
-                [UIView animateWithDuration:0.20 delay:0.0 options:UIViewAnimationOptionCurveEaseInOut | UIViewAnimationOptionBeginFromCurrentState animations:^{
-                    dragProxy.frame = destination;
-                    dragProxy.alpha = 0.88;
-                } completion:^(__unused BOOL finished) {
-                    settledSource.view.alpha = 1.0;
-                    settledBorder.alpha = 1.0;
-                    settledBorder.hidden = NO;
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                        [UIView animateWithDuration:0.18 delay:0.0 options:UIViewAnimationOptionCurveEaseInOut | UIViewAnimationOptionBeginFromCurrentState animations:^{
-                            dragProxy.alpha = 0.0;
-                        } completion:^(__unused BOOL finished) {
-                            [dragProxy removeFromSuperview];
-                        }];
-                    });
+            // After a drop the settings provider swaps and rebuilds the module
+            // containers over several frames. Hiding whichever container exists
+            // at +80ms misses replacements created afterwards, and those show
+            // up as a second copy of the module (at the final slot) while the
+            // drag proxy is still travelling. Keep EVERY live view of the
+            // dropped module hidden on every frame of the flight, and track the
+            // destination continuously so the proxy lands on the real slot.
+            __weak UIViewController *flightOverlay = overlay;
+            NSString *flightID = [sourceID copy];
+            UIView *flightOrigin = moduleView;
+            void (^setSourceVisible)(BOOL) = ^(BOOL visible) {
+                UIViewController *liveOverlay = flightOverlay;
+                if (!liveOverlay) return;
+                [UIView performWithoutAnimation:^{
+                    if (!visible) flightOrigin.alpha = 0.0;
+                    for (UIViewController *candidate in CCACollectModuleControllers(liveOverlay)) {
+                        if (![CCAModuleIdentifier(candidate) isEqualToString:flightID]) continue;
+                        candidate.view.alpha = visible ? 1.0 : 0.0;
+                        UIView *border = objc_getAssociatedObject(candidate.view, @selector(applyEditingToModule:editing:));
+                        if ([border isKindOfClass:[UIView class]]) {
+                            border.alpha = visible ? 1.0 : 0.0;
+                            border.hidden = !visible;
+                        }
+                        UIView *candidateRemove = objc_getAssociatedObject(candidate.view, kCCARemoveButtonKey);
+                        UIView *candidateResize = objc_getAssociatedObject(candidate.view, kCCAResizeButtonKey);
+                        if (candidateRemove) candidateRemove.alpha = visible ? 1.0 : 0.0;
+                        if (candidateResize) candidateResize.alpha = visible ? 1.0 : 0.0;
+                    }
                 }];
-            });
+            };
+            CGRect (^destinationFrame)(void) = ^CGRect{
+                UIViewController *liveOverlay = flightOverlay;
+                UIViewController *best = nil;
+                for (UIViewController *candidate in CCACollectModuleControllers(liveOverlay)) {
+                    if (![CCAModuleIdentifier(candidate) isEqualToString:flightID] || !candidate.view.window) continue;
+                    // Prefer the rebuilt container over the one we hid at release.
+                    if (!best || candidate.view != flightOrigin) best = candidate;
+                }
+                return best ? CCAVisibleModuleFrame(best, liveOverlay) : CGRectNull;
+            };
+            void (^land)(CGRect) = ^(CGRect destination) {
+                if (!CGRectIsNull(destination)) {
+                    [UIView performWithoutAnimation:^{ dragProxy.frame = destination; }];
+                }
+                setSourceVisible(YES);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    [UIView animateWithDuration:0.18 delay:0.0 options:UIViewAnimationOptionCurveEaseInOut | UIViewAnimationOptionBeginFromCurrentState animations:^{
+                        dragProxy.alpha = 0.0;
+                    } completion:^(__unused BOOL finished) {
+                        [dragProxy removeFromSuperview];
+                    }];
+                });
+            };
+            __block BOOL flightStarted = NO;
+            setSourceVisible(NO);
+            [CCAFrameLinkTarget startWithTick:^BOOL(CFTimeInterval elapsed, CFTimeInterval delta) {
+                UIViewController *liveOverlay = flightOverlay;
+                if (!liveOverlay || !liveOverlay.view.window || !dragProxy.superview || !gEditModeActive) {
+                    // Control Center left (or edit mode ended) mid-flight.
+                    setSourceVisible(YES);
+                    [dragProxy removeFromSuperview];
+                    return YES;
+                }
+                setSourceVisible(NO);
+                if (elapsed < 0.08) return NO;   // let the provider finish its relayout
+                if (!flightStarted) {
+                    flightStarted = YES;
+                    CGRect visibleProxyFrame = dragProxy.layer.presentationLayer ? ((CALayer *)dragProxy.layer.presentationLayer).frame : dragProxy.frame;
+                    [UIView performWithoutAnimation:^{ dragProxy.transform = CGAffineTransformIdentity; dragProxy.frame = visibleProxyFrame; }];
+                }
+                CGRect destination = destinationFrame();
+                if (CGRectIsNull(destination)) {
+                    if (elapsed > 0.5) { land(CGRectNull); return YES; }
+                    return NO;
+                }
+                CGFloat blend = 1.0 - exp(-MAX(delta, 1.0 / 120.0) * 22.0);
+                CGRect current = dragProxy.frame;
+                CGRect next = CGRectMake(current.origin.x + (destination.origin.x - current.origin.x) * blend,
+                                         current.origin.y + (destination.origin.y - current.origin.y) * blend,
+                                         current.size.width + (destination.size.width - current.size.width) * blend,
+                                         current.size.height + (destination.size.height - current.size.height) * blend);
+                [UIView performWithoutAnimation:^{
+                    dragProxy.frame = next;
+                    dragProxy.alpha += (0.88 - dragProxy.alpha) * blend;
+                }];
+                BOOL arrived = fabs(destination.origin.x - next.origin.x) < 0.5 && fabs(destination.origin.y - next.origin.y) < 0.5 &&
+                               fabs(destination.size.width - next.size.width) < 0.5 && fabs(destination.size.height - next.size.height) < 0.5;
+                if (arrived || elapsed > 0.6) { land(destination); return YES; }
+                return NO;
+            }];
         } else if (dragProxy) {
             [UIView animateWithDuration:0.20 animations:^{ dragProxy.transform = CGAffineTransformIdentity; } completion:^(__unused BOOL finished) {
                 moduleView.alpha = 1.0;
@@ -9472,6 +9623,25 @@ static NSUInteger CCADerivedVisiblePageForOverlay(UIViewController *overlay) {
     });
 }
 
+// Called the moment Control Center starts leaving the screen on iOS < 16.
+// Leaves edit mode atomically and fades the overlay-hosted chrome out with the
+// dismissal; the late state-0 callback then only has to tidy up.
+- (void)overlayBeginningDismissal:(UIViewController *)overlay {
+    if (!overlay || gCCAExpandedModuleOpen || gCCAOverlayDisappearing) return;
+    gCCAOverlayDisappearing = YES;
+    if (gEditModeActive) [self dismissEditingImmediately];
+    [self setQuickAccessButtonsHidden:YES forOverlay:overlay animated:YES];
+    UIView *pageIndicators = [overlay.view viewWithTag:kCCAPageIndicatorHostTag];
+    UIView *addControl = [overlay.view viewWithTag:kCCAAddControlButtonTag];
+    [UIView animateWithDuration:0.18 delay:0.0
+                        options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionCurveEaseOut
+                     animations:^{
+        pageIndicators.alpha = 0.0;
+        addControl.alpha = 0.0;
+    } completion:nil];
+    [self updateTopFadeForOverlay:overlay presentationAlpha:0.0];
+}
+
 - (void)dismissEditingImmediately {
     if (!gEditModeActive) return;
     ++gCCAEditTransitionGeneration;
@@ -9492,7 +9662,7 @@ static NSUInteger CCADerivedVisiblePageForOverlay(UIViewController *overlay) {
         [self setEditPresentation:NO forOverlay:overlay animated:NO];
         [self updatePageIndicatorsForOverlay:overlay];
         [self updatePagedModuleVisibilityForOverlay:overlay showAdjacent:NO];
-        [self setQuickAccessButtonsHidden:!gCCAControlCenterPresented forOverlay:overlay animated:NO];
+        [self setQuickAccessButtonsHidden:(!gCCAControlCenterPresented || gCCAOverlayDisappearing) forOverlay:overlay animated:NO];
     }
 }
 
@@ -11610,8 +11780,21 @@ static void CCAConfigureExpandedConnectivityChild(UIViewController *child) {
 
 %hook UIViewController
 
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    if (gEnabled && gCCALegacyPresentation && CCAIsOverlayController(self)) gCCAOverlayDisappearing = NO;
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    %orig;
+    if (gEnabled && gCCALegacyPresentation && CCAIsOverlayController(self)) {
+        [[CCAsterCoordinator shared] overlayBeginningDismissal:self];
+    }
+}
+
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
+    if (gEnabled && gCCALegacyPresentation && CCAIsOverlayController(self)) gCCAOverlayDisappearing = NO;
     if (gEnabled && CCAIsOverlayController(self)) [[CCAsterCoordinator shared] installOnOverlay:self];
 }
 
@@ -11700,6 +11883,7 @@ static void CCAConfigureExpandedConnectivityChild(UIViewController *child) {
             // the next open and module expansions start from clean geometry.
             [[CCAsterCoordinator shared] setEditPresentation:NO forOverlay:self animated:NO];
         }
+        gCCAOverlayDisappearing = NO;
     }
 }
 
@@ -11766,6 +11950,7 @@ static void CCAConfigureExpandedConnectivityChild(UIViewController *child) {
         if (CACurrentMediaTime() < gCCAEditExitConsumedUntil) return;
 	    }
     UIViewController *overlay = gOverlayControllers.allObjects.firstObject;
+    if (gEnabled && overlay && gCCALegacyPresentation) [[CCAsterCoordinator shared] overlayBeginningDismissal:overlay];
     if (gEnabled && overlay && !gCCAExpandedModuleOpen) {
         gCCAOwnedDuplicateHostSyncPresented = NO;
         [[CCAsterCoordinator shared] beginOwnedDuplicateHostPresentationSync];
@@ -11852,7 +12037,7 @@ static void CCAConfigureExpandedConnectivityChild(UIViewController *child) {
     NSUInteger chromeGeneration = ++gCCAPresentationChromeGeneration;
     gCCAControlCenterPresentationState = state;
     if (gEnabled && !gCCAExpandedModuleOpen) {
-        if (state == 3 && gEditModeActive && !gCCADragInProgress) {
+        if (state == 3 && gEditModeActive && !gCCADragInProgress && !gCCALegacyPresentation) {
             CCAHaptic();
             gCCAEditExitConsumedUntil = CACurrentMediaTime() + 1.2;
             [[CCAsterCoordinator shared] dismissEditingImmediately];
@@ -13616,6 +13801,7 @@ static void CCAPrefsChanged(__unused CFNotificationCenterRef center, __unused vo
         // below this line runs. (Toggling the master switch needs a respring to
         // fully take effect, since hooks can't be uninstalled live.)
         if (!gEnabled) return;
+        gCCALegacyPresentation = ![[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){16, 0, 0}];
         %init(_ungrouped);
         gOverlayControllers = [NSHashTable weakObjectsHashTable];
         gCCANativeLayoutRects = [NSMutableDictionary dictionary];

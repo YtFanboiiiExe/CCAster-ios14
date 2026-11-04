@@ -1,6 +1,6 @@
 ARCHS = arm64 arm64e
-TARGET = iphone:clang:16.5:15.0
-THEOS_PACKAGE_SCHEME = rootless
+TARGET = iphone:clang:14.5:14.0
+# Rootful build: no THEOS_PACKAGE_SCHEME, files install under / (not /var/jb).
 
 include $(THEOS)/makefiles/common.mk
 

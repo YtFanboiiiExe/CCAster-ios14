@@ -10,7 +10,7 @@
       "views": [
                 {
                     "class": "DepictionMarkdownView",
-                    "markdown": "A modern, editable Control Center experience for iOS 16.\n\nArrange and resize controls on an 8x4 grid, add controls from CCAster's custom sheet, move between multiple pages, and reach editing and power actions from the Control Center header.",
+                    "markdown": "A modern, editable Control Center experience for iOS 14.\n\nArrange and resize controls on an 8x4 grid, add controls from CCAster's custom sheet, move between multiple pages, and reach editing and power actions from the Control Center header.",
                     "useSpacing": true
                 },
         {
@@ -33,7 +33,7 @@
         {
           "class": "DepictionTableTextView",
           "title": "Requires",
-          "text": "iOS 16"
+          "text": "iOS 14"
         },
         {
           "class": "DepictionTableTextView",

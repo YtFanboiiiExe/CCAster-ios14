@@ -46,12 +46,15 @@ extern char **environ;
 }
 
 - (void)respring {
-    const char *path = access("/var/jb/usr/bin/sbreload", X_OK) == 0
-        ? "/var/jb/usr/bin/sbreload"
-        : "/usr/bin/sbreload";
-    const char *arguments[] = { path, NULL };
+    // Rootful iOS 14: prefer sbreload, fall back to killing SpringBoard.
     pid_t pid = 0;
-    posix_spawn(&pid, path, NULL, NULL, (char *const *)arguments, environ);
+    if (access("/usr/bin/sbreload", X_OK) == 0) {
+        const char *arguments[] = { "/usr/bin/sbreload", NULL };
+        posix_spawn(&pid, "/usr/bin/sbreload", NULL, NULL, (char *const *)arguments, environ);
+    } else {
+        const char *arguments[] = { "/usr/bin/killall", "-9", "SpringBoard", NULL };
+        posix_spawn(&pid, "/usr/bin/killall", NULL, NULL, (char *const *)arguments, environ);
+    }
 }
 
 @end

@@ -9,7 +9,7 @@ fi
 echo "$BUILD_OUTPUT" | grep "building package" | tail -1
 DEB=$(ls -t packages/*.deb | head -1)
 scp -q "$DEB" root@192.168.0.190:/tmp/latest.deb || exit 1
-ssh root@192.168.0.190 "PATH=/var/jb/usr/bin:/var/jb/bin:/usr/bin:/bin dpkg -i /tmp/latest.deb" 2>&1 | tail -1
+ssh root@192.168.0.190 "PATH=/usr/bin:/bin dpkg -i /tmp/latest.deb" 2>&1 | tail -1
 # sbreload drops the connection mid-respring; ignore its exit status.
-ssh root@192.168.0.190 "PATH=/var/jb/usr/bin:/var/jb/bin:/usr/bin:/bin sbreload" > /dev/null 2>&1
+ssh root@192.168.0.190 "PATH=/usr/bin:/bin sbreload" > /dev/null 2>&1
 echo deployed
